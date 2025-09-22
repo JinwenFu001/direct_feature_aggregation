@@ -9,6 +9,7 @@ n0=n*10
 k=20
 weight.order=c(-1/2,-1,-2)[((uu-1)%/%nreps)+1]
 
+if(sum(uu==c(55,131,126,146,153))) uu=uu*30
 set.seed(uu)
 result=data.frame()
 for(i in 1:length(p0s)){
