@@ -209,7 +209,7 @@ find_p=function(tree_df){
 # Input: df (original tree_df with node/parent/weight), result (non-leaf summary data.frame with columns: node, depth, leaves, latent_children, weight).
 # Output: data.frame coarest_set with rows of selected nodes and columns (node, depth, leaves, latent_children, weight).
 find_coarest=function(df, result){
-  p=find_p(tree_df)
+  p=find_p(df)
   all_cover = F
   max_depth = max(result$depth)
   coarest_set = result[result$depth == 0, ]
@@ -468,7 +468,7 @@ my_ginv <- function(X, tol = 1e-8) {
   s$v %*% diag(d_inv, length(d_inv)) %*% t(s$u)
 }
 
-############################# This section is the simulation function for 6.1.1 ####################################
+############################# This section contains the simulation functions for 6.1.1 ####################################
 
 # Finds all latent nodes whose subtree’s leaves EXACTLY match each user-specified leaf group.
 # Input: tree_df (data.frame with columns node/parent/weight, etc.), leaf_group_vector (length = #leaves in root order from gather_leaves()).
@@ -564,3 +564,301 @@ find_all_parents=function(tree_df,vec){
   return(parent_vec[!is.na(parent_vec)])
 }
 
+
+# Runs a replicated simulation using a fixed tree and grouping: fits RARE, the tree-guided method, OLS, Ridge, and their oracle group versions; reports test MSEs and clustering agreement.
+# Input: n (train size), n0 (test size), tree_df (node/parent/weight data.frame for the tree), tree_group (length-p group labels), n1 (validation size), s (sparsity), reps (#replicates), ridge.param, thresh, INratio (signal-to-noise control).
+# Output: list of length-'reps' vectors: our.minloss, rare.minloss, our.rand, rare.rand, our.minloss.ideal, rare.minloss.ideal, our.rand.ideal, rare.rand.ideal, oracle.ls.loss, ls.loss, ridge.loss, oracle.ridge.loss.
+simulate_error_given_tree=function(n,n0, trees,tree_df,tree_group,n1=n,s=0,reps=50,ridge.param=0,thresh=1e-5,INratio=5){
+  rare.minloss=numeric(reps)
+  our.minloss=numeric(reps)
+  rare.rand=numeric(reps)
+  our.rand=numeric(reps)
+  rare.minloss.ideal=numeric(reps)
+  our.minloss.ideal=numeric(reps)
+  rare.rand.ideal=numeric(reps)
+  our.rand.ideal=numeric(reps)
+  oracle.ls.loss=numeric(reps)
+  ls.loss=numeric(reps)
+  ridge.loss         = numeric(reps)
+  oracle.ridge.loss  = numeric(reps)
+  for (i in 1:reps) {
+    cat(i,"/",reps,'\n')
+    data=simulate_data(n+n0+n1,tree_group,ratio = INratio,scale.X=TRUE)
+    train_index=sample(1:(n+n0+n1),n)
+    valid_index=sample((1:(n+n0+n1))[- train_index],n1)
+    test_index=(1:(n+n0+n1))[- c(train_index,valid_index)]
+    
+    rare.result=rarefit(data$Y[train_index],data$X[train_index,],hc = trees$tree,alpha = 1,intercept = F)
+    loss1=apply(data$X[valid_index,]%*%rare.result$beta[[1]],2,function(x) sum((x-data$Y[valid_index])^2))
+    loss3=apply(data$X[valid_index,]%*%rare.result$beta[[1]],2,function(x) sum((x-data$X[valid_index,]%*%data$true.beta)^2))
+    
+    rare.beta=rare.result$beta[[1]][,which.min(loss1)]
+    rare.beta.ideal=rare.result$beta[[1]][,which.min(loss3)]
+    rare.minloss[i]=sum((data$Y[test_index]-data$X[test_index,]%*%rare.beta)^2)/n0
+    rare.minloss.ideal[i]=sum((data$Y[test_index]-data$X[test_index,]%*%rare.beta.ideal)^2)/n0
+    our.result=grid.simple_linear(Y = data$Y[train_index],X=data$X[train_index,],tree_df,true_beta= data$true.beta,ridge.param,thresh = thresh)
+    loss2=apply(data$X[valid_index,]%*%our.result$beta,2,function(x) sum((x-data$Y[valid_index])^2))
+    loss4=apply(data$X[valid_index,]%*%our.result$beta,2,function(x) sum((x-data$X[valid_index,]%*%data$true.beta)^2))
+    our.beta=our.result$beta[,which.min(loss2)]
+    our.beta.ideal=our.result$beta[,which.min(loss4)]
+    our.minloss[i]=sum((data$Y[test_index]-data$X[test_index,]%*%our.beta)^2)/n0
+    our.minloss.ideal[i]=sum((data$Y[test_index]-data$X[test_index,]%*%our.beta.ideal)^2)/n0
+    rare.rand[i]=adjustedRandIndex(as.numeric(as.factor(data$true.beta)),as.numeric(as.factor(rare.beta)))
+    rare.rand.ideal[i]=adjustedRandIndex(as.numeric(as.factor(data$true.beta)),as.numeric(as.factor(rare.beta.ideal)))
+    our.rand[i]=adjustedRandIndex(as.numeric(as.factor(data$true.beta)),as.numeric(as.factor(our.beta)))
+    our.rand.ideal[i]=adjustedRandIndex(as.numeric(as.factor(data$true.beta)),as.numeric(as.factor(our.beta.ideal)))
+    
+    
+    ls.X=data$X[train_index,]
+    ls.Y=data$Y[train_index]
+    ls.ginv=my_ginv(crossprod(ls.X))
+    ls.coef=crossprod(ls.ginv,crossprod(ls.X,ls.Y))
+    ls.loss[i]=sum((data$Y[test_index]-data$X[test_index,]%*%ls.coef)^2)/n0
+    
+    Q=make_new_X(data$X,trees$group)
+    ols.X=Q$X1[train_index,]
+    ols.ginv=t(my_ginv(crossprod(ols.X)))
+    ols.coef=crossprod(ols.ginv,crossprod(ols.X,ls.Y))
+    oracle.ls.loss[i]=sum((data$Y[test_index]-Q$X1[test_index,]%*%ols.coef)^2)/n0
+    
+    X_train = data$X[train_index,]
+    Y_train = data$Y[train_index]
+    X_valid = data$X[valid_index,]
+    Y_valid = data$Y[valid_index]
+    X_test  = data$X[test_index,]
+    Y_test  = data$Y[test_index]
+    
+    # alpha=0 => Ridge, intercept=FALSE => no intercept in the model
+    fit_ridge = glmnet(X_train, Y_train, alpha = 0, intercept = FALSE)
+    
+    # The sequence of lambdas in fit_ridge
+    lam_seq   = fit_ridge$lambda
+    
+    # Predictions on validation set for each lambda
+    preds_valid_ridge = predict(fit_ridge, newx = X_valid, s = lam_seq)
+    # Compute validation MSE for each column (each lambda)
+    val_mse_ridge = colMeans((Y_valid - preds_valid_ridge)^2)
+    
+    best_lam_std  = lam_seq[which.min(val_mse_ridge)]
+    
+    # Extract coefficients at best lambda (no intercept in the model)
+    # 'coef(...)' returns a vector of length p+1 (the first is intercept).
+    # But intercept=FALSE means that will be zero, so we can exclude it.
+    beta_ridge_best_full = as.numeric(coef(fit_ridge, s = best_lam_std))
+    beta_ridge_best      = beta_ridge_best_full[-1]  # omit intercept slot
+    
+    # Evaluate on test
+    preds_ridge_test = X_test %*% beta_ridge_best  # no intercept
+    ridge.loss[i] = mean((Y_test - preds_ridge_test)^2)
+    
+    ##-----------------------------------------------------------------
+    ## 6. NEW: Oracle Ridge using glmnet on grouped design Q$X1
+    ##         with no intercept
+    ##-----------------------------------------------------------------
+    or.X_train = Q$X1[train_index, ]
+    or.X_valid = Q$X1[valid_index, ]
+    or.X_test  = Q$X1[test_index, ]
+    
+    fit_oracle_ridge = glmnet(or.X_train, Y_train, alpha = 0, intercept = FALSE)
+    lam_seq_or       = fit_oracle_ridge$lambda
+    
+    preds_valid_or = predict(fit_oracle_ridge, newx = or.X_valid, s = lam_seq_or)
+    val_mse_oracle_ridge = colMeans((Y_valid - preds_valid_or)^2)
+    
+    best_lam_oracle = lam_seq_or[which.min(val_mse_oracle_ridge)]
+    
+    # Extract group-level coefficients at best lambda
+    beta_group_best_full = as.numeric(coef(fit_oracle_ridge, s = best_lam_oracle))
+    beta_group_best      = beta_group_best_full[-1]  # omit the intercept slot
+    
+    # Map from group-level to full p-dim coefficients in feature space
+    beta_or_feature = Q$Q %*% beta_group_best
+    
+    # Evaluate on test set (no intercept)
+    preds_test_or = X_test %*% beta_or_feature
+    oracle.ridge.loss[i] = mean((Y_test - preds_test_or)^2)
+    
+    
+  }
+  return(list(our.minloss=our.minloss,rare.minloss=rare.minloss,our.rand=our.rand,rare.rand=rare.rand,our.minloss.ideal=our.minloss.ideal,rare.minloss.ideal=rare.minloss.ideal,our.rand.ideal=our.rand.ideal,rare.rand.ideal=rare.rand.ideal,oracle.ls.loss=oracle.ls.loss,ls.loss=ls.loss,ridge.loss = ridge.loss,oracle.ridge.loss = oracle.ridge.loss))#,oracle.ridge.loss=oracle.ridge.loss))
+}             
+
+
+############################# This section contains the simulation functions for 6.1.2 ####################################
+
+
+# Generates a block-structured distance matrix for k equal-sized subtrees (p0 leaves each) and builds an hclust tree.
+# Input: k (number of subtrees/groups), p0 (leaves per subtree).
+# Output: list(tree = hclust object from the combined distances, group = length-(k*p0) integer vector of group labels 1...k).
+simulate_combined_tree <- function(k, p0) {
+  # Step 1: Initialize variables
+  total_leaves <- k * p0
+  group_labels <- c()
+  combined_dist <- matrix(0, nrow = total_leaves, ncol = total_leaves)
+  
+  # Step 2: Generate k subtrees
+  start_index <- 1
+  for (i in 1:k) {
+    # Generate latent values for the current subtree
+    latent_values <- rnorm(p0, mean = i, sd = 0.05)
+    
+    # Compute distances for the current subtree
+    subtree_dist <- as.matrix(dist(latent_values))
+    
+    # Place subtree distances into the combined matrix
+    end_index <- start_index + p0 - 1
+    combined_dist[start_index:end_index, start_index:end_index] <- subtree_dist
+    
+    # Assign group labels
+    group_labels <- c(group_labels, rep(i, p0))
+    
+    start_index <- end_index + 1
+  }
+  
+  # Step 3: Add fixed distances between subtrees
+  combined_dist[combined_dist == 0] <- Inf  # Temporarily mark empty cells
+  block_indices <- seq(1, total_leaves, by = p0)
+  
+  for (i in 1:(k - 1)) {
+    start1 <- block_indices[i]
+    end1 <- start1 + p0 - 1
+    start2 <- block_indices[i + 1]
+    end2 <- start2 + p0 - 1
+    
+    combined_dist[start1:end1, start2:end2] <- 10  # Fixed distance between subtrees
+    combined_dist[start2:end2, start1:end1] <- 10  # Symmetric assignment
+  }
+  
+  # Step 4: Replace remaining Inf values with large finite distances
+  combined_dist[is.infinite(combined_dist)] <- max(combined_dist[is.finite(combined_dist)]) * 2
+  
+  # Step 5: Convert to a valid distance object
+  combined_dist <- as.dist(combined_dist)
+  
+  # Step 6: Perform hierarchical clustering
+  combined_tree <- hclust(combined_dist, method = "average")
+  
+  # Return the hierarchical tree and group labels
+  return(list(tree = combined_tree, group = group_labels))
+}
+
+# Repeatedly simulates data under a fixed/provided tree, fits multiple methods (RARE, ours, OLS/Ridge + oracle variants), and evaluates test MSE and ARI.
+# Input: n (train size), n0 (test size), p0 (leaves per group), k (number of groups), n1 (validation size, default n), s (sparsity), reps, ridge.param, thresh, beta.specify (optional group-level β), tree.specify (optional prebuilt list(tree, group)), INratio (SNR), weight.order.
+# Output: list of length-reps vectors: our.minloss, rare.minloss, our.rand, rare.rand, our.minloss.ideal, rare.minloss.ideal, our.rand.ideal, rare.rand.ideal, oracle.ls.loss, ls.loss, ridge.loss, oracle.ridge.loss.
+simulate_error_tree1_valid=function(n,n0,p0,k,n1=n,s=0,reps=50,ridge.param=0,thresh=1e-5,beta.specify=NULL,tree.specify=NULL,INratio=5,weight.order=-1){
+  rare.minloss=numeric(reps)
+  our.minloss=numeric(reps)
+  rare.rand=numeric(reps)
+  our.rand=numeric(reps)
+  rare.minloss.ideal=numeric(reps)
+  our.minloss.ideal=numeric(reps)
+  rare.rand.ideal=numeric(reps)
+  our.rand.ideal=numeric(reps)
+  oracle.ls.loss=numeric(reps)
+  ls.loss=numeric(reps)
+  ridge.loss         = numeric(reps)
+  oracle.ridge.loss  = numeric(reps)
+  if(is.null(tree.specify)) trees=simulate_combined_tree(k,p0)
+  else trees=tree.specify
+  for (i in 1:reps) {
+    cat(i,"/",reps,'\n')
+    tree_df=hclust_to_df(trees$tree)
+    data=simulate_data(n+n0+n1,trees$group,beta.pre = beta.specify,ratio=INratio)
+    train_index=sample(1:(n+n0+n1),n)
+    valid_index=sample((1:(n+n0+n1))[- train_index],n1)
+    test_index=(1:(n+n0+n1))[- c(train_index,valid_index)]
+    
+    rare.result=rarefit(data$Y[train_index],data$X[train_index,],hc = trees$tree,alpha = 1,intercept = F)
+    loss1=apply(data$X[valid_index,]%*%rare.result$beta[[1]],2,function(x) sum((x-data$Y[valid_index])^2))
+    loss3=apply(data$X[valid_index,]%*%rare.result$beta[[1]],2,function(x) sum((x-data$X[valid_index,]%*%data$true.beta)^2))
+    
+    rare.beta=rare.result$beta[[1]][,which.min(loss1)]
+    rare.beta.ideal=rare.result$beta[[1]][,which.min(loss3)]
+    rare.minloss[i]=sum((data$Y[test_index]-data$X[test_index,]%*%rare.beta)^2)/n0
+    rare.minloss.ideal[i]=sum((data$Y[test_index]-data$X[test_index,]%*%rare.beta.ideal)^2)/n0
+    our.result=grid.simple_linear(Y = data$Y[train_index],X=data$X[train_index,],tree_df,true_beta= data$true.beta,ridge.param,thresh = thresh)
+    loss2=apply(data$X[valid_index,]%*%our.result$beta,2,function(x) sum((x-data$Y[valid_index])^2))
+    loss4=apply(data$X[valid_index,]%*%our.result$beta,2,function(x) sum((x-data$X[valid_index,]%*%data$true.beta)^2))
+    our.beta=our.result$beta[,which.min(loss2)]
+    our.beta.ideal=our.result$beta[,which.min(loss4)]
+    our.minloss[i]=sum((data$Y[test_index]-data$X[test_index,]%*%our.beta)^2)/n0
+    our.minloss.ideal[i]=sum((data$Y[test_index]-data$X[test_index,]%*%our.beta.ideal)^2)/n0
+    rare.rand[i]=adjustedRandIndex(as.numeric(as.factor(data$true.beta)),as.numeric(as.factor(rare.beta)))
+    rare.rand.ideal[i]=adjustedRandIndex(as.numeric(as.factor(data$true.beta)),as.numeric(as.factor(rare.beta.ideal)))
+    our.rand[i]=adjustedRandIndex(as.numeric(as.factor(data$true.beta)),as.numeric(as.factor(our.beta)))
+    our.rand.ideal[i]=adjustedRandIndex(as.numeric(as.factor(data$true.beta)),as.numeric(as.factor(our.beta.ideal)))
+    
+    
+    ls.X=data$X[train_index,]
+    ls.Y=data$Y[train_index]
+    ls.ginv=my_ginv(crossprod(ls.X))
+    ls.coef=crossprod(ls.ginv,crossprod(ls.X,ls.Y))
+    ls.loss[i]=sum((data$Y[test_index]-data$X[test_index,]%*%ls.coef)^2)/n0
+    
+    Q=make_new_X(data$X,trees$group)
+    ols.X=Q$X1[train_index,]
+    ols.ginv=t(my_ginv(crossprod(ols.X)))
+    ols.coef=crossprod(ols.ginv,crossprod(ols.X,ls.Y))
+    oracle.ls.loss[i]=sum((data$Y[test_index]-Q$X1[test_index,]%*%ols.coef)^2)/n0
+    
+    X_train = data$X[train_index,]
+    Y_train = data$Y[train_index]
+    X_valid = data$X[valid_index,]
+    Y_valid = data$Y[valid_index]
+    X_test  = data$X[test_index,]
+    Y_test  = data$Y[test_index]
+    
+    # alpha=0 => Ridge, intercept=FALSE => no intercept in the model
+    fit_ridge = glmnet(X_train, Y_train, alpha = 0, intercept = FALSE)
+    
+    # The sequence of lambdas in fit_ridge
+    lam_seq   = fit_ridge$lambda
+    
+    # Predictions on validation set for each lambda
+    preds_valid_ridge = predict(fit_ridge, newx = X_valid, s = lam_seq)
+    # Compute validation MSE for each column (each lambda)
+    val_mse_ridge = colMeans((Y_valid - preds_valid_ridge)^2)
+    
+    best_lam_std  = lam_seq[which.min(val_mse_ridge)]
+    
+    # Extract coefficients at best lambda (no intercept in the model)
+    # 'coef(...)' returns a vector of length p+1 (the first is intercept).
+    # But intercept=FALSE means that will be zero, so we can exclude it.
+    beta_ridge_best_full = as.numeric(coef(fit_ridge, s = best_lam_std))
+    beta_ridge_best      = beta_ridge_best_full[-1]  # omit intercept slot
+    
+    # Evaluate on test
+    preds_ridge_test = X_test %*% beta_ridge_best  # no intercept
+    ridge.loss[i] = mean((Y_test - preds_ridge_test)^2)
+    
+    ##-----------------------------------------------------------------
+    ## 6. NEW: Oracle Ridge using glmnet on grouped design Q$X1
+    ##         with no intercept
+    ##-----------------------------------------------------------------
+    or.X_train = Q$X1[train_index, ]
+    or.X_valid = Q$X1[valid_index, ]
+    or.X_test  = Q$X1[test_index, ]
+    
+    fit_oracle_ridge = glmnet(or.X_train, Y_train, alpha = 0, intercept = FALSE)
+    lam_seq_or       = fit_oracle_ridge$lambda
+    
+    preds_valid_or = predict(fit_oracle_ridge, newx = or.X_valid, s = lam_seq_or)
+    val_mse_oracle_ridge = colMeans((Y_valid - preds_valid_or)^2)
+    
+    best_lam_oracle = lam_seq_or[which.min(val_mse_oracle_ridge)]
+    
+    # Extract group-level coefficients at best lambda
+    beta_group_best_full = as.numeric(coef(fit_oracle_ridge, s = best_lam_oracle))
+    beta_group_best      = beta_group_best_full[-1]  # omit the intercept slot
+    
+    # Map from group-level to full p-dim coefficients in feature space
+    beta_or_feature = Q$Q %*% beta_group_best
+    
+    # Evaluate on test set (no intercept)
+    preds_test_or = X_test %*% beta_or_feature
+    oracle.ridge.loss[i] = mean((Y_test - preds_test_or)^2)
+    
+    
+  }
+  return(list(our.minloss=our.minloss,rare.minloss=rare.minloss,our.rand=our.rand,rare.rand=rare.rand,our.minloss.ideal=our.minloss.ideal,rare.minloss.ideal=rare.minloss.ideal,our.rand.ideal=our.rand.ideal,rare.rand.ideal=rare.rand.ideal,oracle.ls.loss=oracle.ls.loss,ls.loss=ls.loss,ridge.loss = ridge.loss,oracle.ridge.loss = oracle.ridge.loss))#,oracle.ridge.loss=oracle.ridge.loss))
+}      

@@ -1,7 +1,6 @@
 uu <- as.numeric(Sys.getenv('SLURM_ARRAY_TASK_ID'))
 
-source("/code/scaled_functions.R")
-source("/code/vary_tree.R")
+source("/code/functions.R")
 set.seed(20)
 n=50
 n0=500
@@ -30,7 +29,7 @@ result=data.frame()
 for(i in 1:length(df_list)){
     set.seed(uu)
     tree_df=df_list[[i]]
-    single.result=as.data.frame(simulate_error_given_tree(n=n,n0=n0, tree_df=tree_df,tree_group=trees$group,n1=n,s=0,reps=1,ridge.param=0,thresh=1e-5,INratio=5))
+    single.result=as.data.frame(simulate_error_given_tree(n=n,n0=n0, trees=trees, tree_df=tree_df,tree_group=trees$group,n1=n,s=0,reps=1,ridge.param=0,thresh=1e-5,INratio=5))
     result=rbind(result,single.result)
     cat(i,'is finished\n')
 }
