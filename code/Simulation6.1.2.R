@@ -9,14 +9,17 @@ n0=n*10
 k=20
 weight.order=c(-1/2,-1,-2)[((uu-1)%/%nreps)+1]
 
-if(sum(uu==c(55,131,126,146,153))) uu=uu*30
-set.seed(uu)
+if(sum(((uu-1)%%nreps + 1)==c(55,131,126,146,153))){
+  set.seed(uu*30)
+}else{
+  set.seed(uu)
+}
 result=data.frame()
 for(i in 1:length(p0s)){
-    p0=p0s[i]
-    single.result=as.data.frame(simulate_error_tree1_valid(n=n,n0=n0,p0=p0,k=k,reps=1,weight.order=weight.order))
-    result=rbind(result,single.result)
-    cat(i,',',p0,'is finished\n')
+  p0=p0s[i]
+  single.result=as.data.frame(simulate_error_tree1_valid(n=n,n0=n0,p0=p0,k=k,reps=1,weight.order=weight.order,fix_sigma=1))
+  result=rbind(result,single.result)
+  cat(i,',',p0,'is finished\n')
 }
 
 rownames(result)=p0s
