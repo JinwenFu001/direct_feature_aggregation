@@ -8,6 +8,7 @@ library(fossil)
 library(mclust)
 library(profvis)
 library(glmnet)
+library(pROC)
 
 
 ############################## This section handles the trees #################################
@@ -115,7 +116,7 @@ gather_leaf_nodes_per_non_leaf <- function(df) {
   return(list(list_result = result, df_result = non_leaf_nodes_df))
 }
 
-################################# This section includes algorithms for squares loss ################################
+############################################## This section includes algorithms for squares loss #################################################
 
 # Accelerated proximal gradient (FISTA) solver for squared loss + ridge + tree-guided aggregation penalty (via prox_tree with backtracking).
 # Input: Y (n-vector), X (n*p), tree_result (list from gather_leaf_nodes_per_non_leaf)$list_result, lambda (numeric), warm_start (bool), init_beta (p-vector), intercept (bool), ridge_param (numeric), thresh (numeric).
@@ -318,7 +319,581 @@ grid.simple_linear=function(Y,X,tree_df,true_beta,ridge.param=0,seqc=NULL,thresh
   return(list(loss=loss,beta=beta,lambda=seqc))
 }
 
-############################ This section simulates the data ################################
+
+# Cross-validates the tree-guided squared-loss model to pick lambda, then refits on all data.
+# Input: Y (n), X (n*p), tree_df (tree metadata), folds, seqc, thresh, ridge.param, intercept, Mmratio.
+# Output: list(selected.param, beta, valid.error).
+cv.simple_linear=function (Y, X, tree_df, folds = 5, seqc = NULL,
+    thresh = 1e-05, ridge.param = 0, intercept = F, Mmratio = 10000) 
+{
+    n = length(Y)
+    p = ncol(X)
+    stopifnot(n >= 2 * folds)
+    
+    random_sequence <- sample(1:n)
+    index <- cut(random_sequence, breaks = folds, labels = FALSE)
+    tree_result = gather_leaf_nodes_per_non_leaf(tree_df)
+    coarest_set = find_coarest(tree_df, tree_result$df_result)
+    penalty.max = find_max_param.linear(Y, X, coarest_set)
+    if (is.null(seqc)) {
+        seqc = exp(seq(log(penalty.max/Mmratio), log(penalty.max), 
+            length = 50))
+    }
+    seqc = sort(seqc, decreasing = T)
+    vals.mat = matrix(0, nrow = folds, ncol = length(seqc))
+    colnames(vals.mat) = seqc
+    for (i in 1:folds) {
+        print(i)
+        X_train = X[which(index != i), ]
+        X_test = X[which(index == i), ]
+        Y_train = Y[which(index != i)]
+        Y_test = Y[which(index == i)]
+        res = grid.simple_linear(Y = Y_train, X = X_train, tree_df = tree_df, 
+            true_beta = rep(0, p), seqc = seqc, thresh = thresh, 
+            ridge.param = ridge.param)
+        #vals.mat[i, ] = negtv_lglkh(Y_test, X_test, beta = res$beta)
+        vals.mat[i, ] = apply(crossprod(t(X_test),res$beta),2,function(x) mean((Y_test-x)^2))
+    }
+    vals.vec = apply(vals.mat, 2, mean)
+    selected.param = seqc[which.min(vals.vec)]
+    beta = acc_prox_simple_linear(Y, X, tree_result$list_result, 
+        lambda = selected.param, intercept = intercept, ridge_param = ridge.param)
+    return(list(selected.param = selected.param, beta = beta, 
+        valid.error = vals.vec))
+}
+
+                              
+# Cross-validates RARE (linear/Gaussian) to pick lambda, then refits on all data.
+# Input: Y (n), X (n*p), tree_df, folds, seqc, thresh, ridge.param, intercept.
+# Output: list(selected.param, beta, valid.error).
+cv.rare.linear=function (Y, X, tree_df, folds = 5, seqc = NULL, thresh = 1e-05, ridge.param = 0, intercept = F) 
+{
+    n = length(Y)
+    p = ncol(X)
+    stopifnot(n >= 2 * folds)
+    random_sequence <- sample(1:n)
+    index <- cut(random_sequence, breaks = folds, labels = FALSE)
+    A=df_to_A(tree_df = tree_df,p)
+    A_sparse <- as(A, "dgCMatrix")
+    if (is.null(seqc)) {
+        seqc = rarefit(y = Y, X = X, A=A_sparse, 
+            intercept = F,alpha=1)$lambda
+    }
+    seqc = sort(seqc, decreasing = T)
+    vals.mat = matrix(0, nrow = folds, ncol = length(seqc))
+    colnames(vals.mat) = seqc
+    for (i in 1:folds) {
+        print(i)
+        X_train = X[which(index != i), ]
+        X_test = X[which(index == i), ]
+        Y_train = Y[which(index != i)]
+        Y_test = Y[which(index == i)]
+        res = rarefit(y = Y_train, X = X_train, A_sparse, intercept = F, lambda = seqc,alpha = 1)
+        #print(length(res$beta))
+        vals.mat[i, ] = apply(res$beta[[1]],2,function(x) mean((Y_test-crossprod(t(X_test),x))^2))
+    }
+    vals.vec = apply(vals.mat, 2, mean)
+    selected.param = seqc[which.min(vals.vec)]
+    beta = as.numeric(rarefit(Y, X, A_sparse, intercept = F, lambda = selected.param,alpha=1)$beta[[1]])
+    return(list(selected.param = selected.param, beta = beta, 
+        valid.error = vals.vec))
+}
+
+
+# Estimates an in-sample signal-to-noise ratio for RARE via K-fold CV.
+# Input: y (n), X (n*p), tree_df, folds.
+# Output: mean SNR across folds (numeric scalar).
+INratio_rare=function(y,X,tree_df,folds=5){
+    n=nrow(X)
+    p=ncol(X)
+    random_sequence <- sample(1:n)
+    index <- cut(random_sequence, breaks = folds, labels = FALSE)
+    snr_seq=numeric(folds)
+    for(i in 1:folds){
+        X.train=X[index!=i,]
+        y.train=y[index!=i]
+        X.test=X[index==i,]
+        y.test=y[index==i]
+        #print(dim(X.train))
+        #print(length(y.train))
+        
+        model=cv.rare.linear(y.train,X.train,tree_df,folds = folds,intercept = F)
+        beta=model$beta
+        #print(beta)
+        predictions <- as.vector(X.test %*% beta)
+        mse <- mean((y.test - predictions)^2)
+        var_pred <- var(predictions)
+        snr_seq[i] <- var_pred / mse
+    }
+    return(mean(snr_seq))
+}
+
+                              
+# One train/validation split comparing LASSO, Ridge, RARE, and our tree-guided model (Gaussian loss).
+# Input: y (n), X (n*p), tree_df, split.seed, nfolds, nval, ridge_param, Mmratio.
+# Output: list of coefficients, losses, and selected lambda for each method (+ optional “new LASSO” on grouped X).
+real_data_one_round.linear=function (y, X, tree_df, split.seed = 123, nfolds = 5, nval = 31, 
+    ridge_param = 0, Mmratio = 10000) 
+{
+    n = nrow(X)
+    p = ncol(X)
+    set.seed(split.seed)
+    index = sample(1:nrow(X), nval)
+    X.train = X[-index, ]
+    X.test = X[index, ]
+    y.train = y[-index]
+    y.test = y[index]
+    set.seed(2 * split.seed)
+    lasso.mod = cv.glmnet(X.train, y.train, family = "gaussian", 
+        alpha = 1, intercept = F, nfolds = nfolds)
+    lasso.beta = as.numeric(glmnet(X.train, y.train, family = "gaussian", 
+        alpha = 1, intercept = F, lambda = lasso.mod$lambda.min)$beta)
+    lasso.loss = mean((y.test - crossprod(t(X.test), lasso.beta))^2)
+    lasso.param = lasso.mod$lambda.min
+    set.seed(2 * split.seed)
+    ridge.mod = cv.glmnet(X.train, y.train, family = "gaussian", 
+        alpha = 0, intercept = F, nfolds = nfolds)
+    ridge.beta = as.numeric(glmnet(X.train, y.train, family = "gaussian", 
+        alpha = 0, intercept = F, lambda = ridge.mod$lambda.min)$beta)
+    ridge.loss = mean((y.test - crossprod(t(X.test), ridge.beta))^2)
+    ridge.param = ridge.mod$lambda.min
+    set.seed(2 * split.seed)
+    rare.mod = cv.rare.linear(y.train, X.train, tree_df, folds = nfolds)
+    rare.beta = as.numeric(rare.mod$beta)
+    rare.loss = mean((y.test - crossprod(t(X.test), rare.beta))^2)
+    rare.param = rare.mod$selected.param
+    set.seed(2 * split.seed)
+    our.mod = cv.simple_linear(y.train, X.train, tree_df, folds = nfolds, 
+        ridge.param = ridge_param, Mmratio = Mmratio)
+    our.beta = our.mod$beta
+    our.loss = mean((y.test - crossprod(t(X.test), our.beta))^2)
+    our.param = our.mod$selected.param
+    
+    if(length(table(our.beta))>1){
+        our.levels=factor(our.beta,labels = 1:length(table(our.beta)))
+        new.X.train=matrix(0,nrow = nrow(X.train),ncol=length(table(our.beta)))
+        new.X.test=matrix(0,nrow = nrow(X.test),ncol=length(table(our.beta)))
+        for(i in 1:length(table(our.beta))){
+            new.X.train[,i]=rowSums(as.matrix(X.train[,which(our.levels==i)],nrow=nrow(X.train)))
+            new.X.test[,i]=rowSums(as.matrix(X.test[,which(our.levels==i)],nrow=nrow(X.test)))
+        }
+        set.seed(2 * split.seed)
+        new.lasso.mod=cv.glmnet(new.X.train, y.train, family = "gaussian", 
+        alpha = 1, intercept = F, nfolds = nfolds)
+        new.lasso.beta = as.numeric(glmnet(new.X.train, y.train, family = "gaussian", 
+        alpha = 1, intercept = F, lambda = lasso.mod$lambda.min)$beta)
+        new.lasso.loss = mean((y.test - crossprod(t(new.X.test), new.lasso.beta))^2)
+        new.lasso.param = new.lasso.mod$lambda.min
+    }else{
+        new.lasso.beta=new.lasso.loss=new.lasso.param=NA
+    }
+    return(list(lasso.beta = lasso.beta, lasso.loss = lasso.loss, 
+        lasso.param = lasso.param, ridge.beta = ridge.beta, ridge.loss = ridge.loss, 
+        ridge.param = ridge.param, rare.beta = rare.beta, rare.loss = rare.loss, 
+        rare.param = rare.param, our.beta = our.beta, our.loss = our.loss, 
+        our.param = our.param,new.lasso.beta = new.lasso.beta, new.lasso.loss = new.lasso.loss, 
+        new.lasso.param = new.lasso.param))
+}
+
+
+###############################################  This section includes algorithms for entropy loss ################################################
+
+#FISTA solver for logistic loss with ridge and tree-guided proximal step (with backtracking and optional warm start).
+#Input: Y (n), X (n*p), tree_result (from gather_leaf_nodes_per_non_leaf)$list_result, lambda, warm_start, init_beta, intercept, ridge_param, thresh.
+#Output: beta (p) if intercept=FALSE; otherwise list(beta0, beta1).
+acc_prox_simple_logistic=function(Y,X,tree_result,lambda,warm_start=F,init_beta=NULL,intercept=F,ridge_param=0,thresh=1e-6){
+  if(intercept){
+    Y.mean=mean(Y)
+    X.mean=apply(X, 2, mean)
+    Y=Y-Y.mean
+    X=scale(X,scale = F)
+  }
+  
+  p=ncol(X)
+  n=nrow(X)
+  if (warm_start & !is.null(init_beta)) {
+    beta0 = beta1 = init_beta
+  } else {
+    beta0 = beta1 = rep(1, p)
+  }
+  
+  alpha0=1
+  alpha1=0.5
+  
+  matXX=crossprod(X)
+  L0=eigen(matXX)$values[1]/n
+  tao=n/L0
+  
+  matXY=crossprod(X,Y)
+  
+  iter=0
+  dis=1
+  consecutive_below_thresh = 0
+  
+  while (consecutive_below_thresh < 5 && iter<1e6) {
+    iter=iter+1
+    accept=F
+    Gam=beta0+(alpha0-1)/alpha1*(beta1-beta0)
+    
+    matXGam=crossprod(t(X),Gam)
+    exp.matXGam=exp(matXGam)
+    base1=crossprod(X,exp.matXGam/(1+exp.matXGam)-Y)+ridge_param*Gam
+    while (!accept){
+      eta=Gam-tao*base1/n
+      eta.new=prox_tree(eta,lambda = tao*lambda, tree_result)
+      if(mean(log(1+exp(crossprod(t(X),eta.new))))-mean(crossprod(t(X),eta.new)*Y) <= mean(log(1+exp.matXGam))-mean(matXGam*Y) + sum((crossprod(X,exp.matXGam/(1+exp.matXGam)-Y)/n)*(eta.new-Gam)) + sum((eta.new-Gam)^2)/(2*tao) || tao <= 1/L0){
+        accept=T
+      }
+      else{
+        tao=max(tao/2,1/L0)
+      }
+    }
+    beta0=beta1
+    beta1=eta.new
+    old.obj=mean(log(1+exp(crossprod(t(X),beta0))))-mean(crossprod(t(X),beta0)*Y)
+    new.obj=mean(log(1+exp(crossprod(t(X),beta1))))-mean(crossprod(t(X),beta1)*Y)
+    dis=abs((new.obj-old.obj)/old.obj)
+    
+    if (dis < thresh) {
+      consecutive_below_thresh = consecutive_below_thresh + 1
+    } else {
+      consecutive_below_thresh = 0
+    }
+    
+    alpha0=alpha1
+    alpha1=(1+sqrt(1+4*alpha0^2))/2
+  }
+  
+  if(!intercept){
+    return(as.vector(beta1)) 
+  }
+  else{
+    return(list(beta0=Y.mean-sum(X.mean*beta1),beta1=as.vector(beta1)))
+  }
+}
+
+#Computes lambda_max for the tree penalty via grouped collapse Q and a logistic GLM fit on XQ.
+#Input: Y (n), X (n*p), coarest_set (from find_coarest with leaves/weight).
+#Output: numeric scalar lambda_max/n.
+find_max_param.logistic=function (Y, X, coarest_set) {
+    p = ncol(X)
+    n = nrow(X)
+    leaves = 1:p
+    valid_set = coarest_set[coarest_set$weight != 0, ]
+    p1 = p - sum(unlist(lapply(valid_set$leaves, length))) + 
+        nrow(valid_set)
+    Q = matrix(0, nrow = p, ncol = p1)
+    remain = rep(1, length(leaves))
+    for (i in 1:nrow(valid_set)) {
+        ind = match(valid_set[i, ]$leaves[[1]], leaves)
+        Q[ind, i] = 1
+        remain[ind] = 0
+    }
+    indiv_num = sum(remain)
+    if (indiv_num > 0) 
+        Q[which(remain == 1), (p1 - indiv_num + 1):p1] = diag(indiv_num)
+    X1 = X %*% Q
+    fit <- glm(Y ~ X1 + 0, family = binomial(link = "logit"))
+    beta1 = coef(fit)
+    target = crossprod(X, Y - 1/(1 + exp(-crossprod(t(X1), beta1))))
+    vals = sqrt((t(Q) %*% target^2)[1:nrow(valid_set)])/valid_set$weight
+    return(max(vals)/n)
+}
+
+
+#Solves the tree-guided logistic model along a lambda-grid (warm starts) and records coefficient paths and MSE vs true beta.
+#Input: Y (n), X (n*p), tree_df, true_beta (p), ridge.param, seqc (optional lambda vector), thresh.
+#Output: list(loss (|lambda|), beta (p*|lambda|), lambda (|lambda|)).
+grid.logistic=function(Y,X,tree_df,true_beta,ridge.param=0,seqc=NULL,thresh=1e-5){
+  n=length(Y)
+  p=ncol(X)
+  tree_result=gather_leaf_nodes_per_non_leaf(tree_df)
+  coarest_set=find_coarest(tree_df,tree_result$df_result)
+  penalty.max=find_max_param.logistic(Y,X,coarest_set)
+  if(is.null(seqc)){
+    seqc=exp(seq(-4-log(n),log(penalty.max),length=50))
+  }
+  Y1=Y
+  X1=X
+  beta=matrix(0,nrow = p ,ncol = length(seqc))
+  beta[,1]=acc_prox_simple_logistic(Y1, X1,tree_result$list_result,lambda = seqc[1],ridge_param = ridge.param,thresh = thresh)
+  for (i in 2:length(seqc)) {
+    beta[,i]=acc_prox_simple_logistic(Y1, X1,tree_result$list_result,lambda = seqc[i],warm_start = T,init_beta = as.vector(beta[,i-1]),ridge_param = ridge.param,thresh = thresh)
+  }
+  loss=apply(matrix(rep(true_beta,length(seqc)),nrow = p,byrow = F)-beta,2,function(x) sum(x^2))/p
+  return(list(loss=loss,beta=beta,lambda=seqc))
+}
+             
+
+#Fits logistic RARE with a tree-expanded design A (built from tree_df) and group-wise penalty factors.
+#Input: y (n), X (n*p), tree_df, A (ignored; built internally), hc (unused), intercept, lambda (optional), nlam, lam.min.ratio, eps, maxite.
+#Output: list(beta0 (0s), beta (p×|lambda|), gamma (|A|×|lambda|), lambda, A, intercept).
+rarefit.logistic=function (y, X, tree_df = NULL,A=NULL,hc, intercept = F, lambda = NULL, nlam = 50, 
+    lam.min.ratio = 1e-04, eps = 1e-05, maxite = 1e+06) 
+{
+    n <- nrow(X)
+    p <- ncol(X)
+    A=df_to_A(tree_df,p)
+    tree_result=gather_leaf_nodes_per_non_leaf(tree_df)$df_result
+    tree_result=tree_result[order(tree_result$depth,decreasing = T), ]
+    zero.ind=which(tree_result$depth==0)+p
+    nnodes <- ncol(A)
+    penalty.factor=rep(1,nnodes)
+    penalty.factor[zero.ind]=0
+    X_use <- X <- as.matrix(X)
+    y_use <- as.vector(y)
+    if (is.null(lambda)) {
+        lambda <- max(abs(t(X_use %*% A) %*% (y_use - 1/2)))/n * 
+            exp(seq(0, log(lam.min.ratio), len = nlam))
+    }
+    else {
+        if (min(lambda) < 0) 
+            stop("lambda cannot be negative.")
+        nlam <- length(lambda)
+    }
+    beta0 = numeric(nlam)
+    beta <- gamma <- c()
+    ret <- glmnet(X_use %*% A, y_use, family = "binomial", lambda = lambda, 
+        standardize = F, intercept = F, penalty.factor = penalty.factor, thresh = eps, maxit = maxite)
+    beta <- as.matrix(A %*% ret$beta)
+    gamma <- as.matrix(ret$beta)
+    list(beta0 = beta0, beta = beta, gamma = gamma, lambda = lambda, 
+        A = A, intercept = intercept)
+}
+
+             
+
+#Computes average negative log-likelihood for logistic regression at given coefficients.
+#Input: Y (n or scalar), X (n*p or 1*p), beta (p*m or p).
+#Output: numeric (or length-m numeric) negative log-likelihood.
+negtv_lglkh=function(Y,X,beta){
+    n=nrow(X)
+    temp=crossprod(t(X),beta)
+    return(1/n*as.numeric(-crossprod(Y,temp)+colSums(log(1+exp(temp)))))
+}
+             
+
+#K-fold CV to select lambda for the tree-guided logistic model; returns selected lambda and refit coefficients.
+#Input: Y (n), X (n*p), tree_df, folds, seqc (optional lambda grid), neg.ind (optional indices for stratification), thresh, ridge.param, intercept, Mmratio.
+#Output: list(selected.param, beta (p), valid.error (per-lambda mean loss)).
+cv.logistic=function(Y,X,tree_df,folds=5,seqc=NULL,neg.ind=NULL,thresh=1e-5,ridge.param=0,intercept=F,Mmratio=1e+4){
+  n=length(Y)
+  p=ncol(X)
+  stopifnot(n>=2*folds)
+
+  if(is.null(neg.ind)){
+      random_sequence <- sample(1:n)
+      index <- cut(random_sequence, breaks=folds, labels=FALSE)
+  }else{
+      pos.ind.rand=sample((1:n)[-neg.ind])
+      neg.ind.rand=sample(neg.ind)
+      pos.partition=cut(pos.ind.rand, breaks=folds, labels=FALSE)
+      neg.partition=cut(neg.ind.rand, breaks=folds, labels=FALSE)
+      index=numeric(n)
+      index[-neg.ind]=pos.partition
+      index[neg.ind]=neg.partition
+  }
+  #print(index)
+    
+    
+  tree_result=gather_leaf_nodes_per_non_leaf(tree_df)
+  coarest_set=find_coarest(tree_df,tree_result$df_result)
+  penalty.max=find_max_param.logistic(Y,X,coarest_set)
+  #print(penalty.max)
+  if(is.null(seqc)){
+    seqc=exp(seq(log(penalty.max/Mmratio),log(penalty.max),length=50))
+  }
+  seqc=sort(seqc,decreasing = T)
+  vals.mat=matrix(0,nrow = folds,ncol = length(seqc))
+  colnames(vals.mat)=seqc
+  
+  for(i in 1:folds){
+    print(i)
+    X_train=X[which(index!=i),]
+    X_test=X[which(index==i),]
+    
+    Y_train=Y[which(index!=i)]
+    Y_test=Y[which(index==i)]
+      
+    res=grid.logistic(Y = Y_train,X = X_train,tree_df = tree_df,true_beta = rep(0,p),seqc = seqc,thresh = thresh,ridge.param = ridge.param)
+    vals.mat[i,]=negtv_lglkh(Y_test,X_test,beta = res$beta)
+  }
+    #print(vals.mat)
+  vals.vec=apply(vals.mat, 2, mean)
+  selected.param=seqc[which.min(vals.vec)]
+  beta=acc_prox_simple_logistic(Y,X,tree_result$list_result,lambda = selected.param,intercept = intercept,ridge_param = ridge.param)
+  return(list(selected.param=selected.param,beta=beta,valid.error=vals.vec))
+}
+
+#Leave-one-out CV over a lambda-grid for the tree-guided logistic model.
+#Input: Y (n), X (n*p), tree_df, seqc (optional lambda grid).
+#Output: list(cve (n*|lambda| losses), selected.param (length n), seqc).
+loocv.logistic=function(Y,X,tree_df,seqc=NULL){
+    n=length(Y)
+    p=ncol(X)
+    
+    tree_result=gather_leaf_nodes_per_non_leaf(tree_df)
+  coarest_set=find_coarest(tree_df,tree_result$df_result)
+  penalty.max=find_max_param.logistic(Y,X,coarest_set)
+  #print(penalty.max)
+  if(is.null(seqc)){
+    seqc=exp(seq(log(penalty.max/1e+4),log(penalty.max),length=50))
+  }
+    cve=matrix(0,nrow=n,ncol=length(seqc))
+    selected.param=numeric(n)
+    for(i in 1:n){
+        print(i)
+        res=grid.logistic(Y[-i],X[-i,],tree_df,true_beta = rep(0,p),seqc = seqc,ridge.param = ridge.param)
+        loss=negtv_lglkh(Y[i],matrix(X[i,],nrow=1),res$beta)
+        #loss=(1/(1+exp(-crossprod(X[i,],res$beta)))>0.5)!=Y[i]
+        cve[i,]=loss
+        selected.param[i]=which.min(loss)
+    }
+    
+    return(list(cve=cve,selected.param=selected.param,seqc=seqc))
+}
+
+
+#Builds an expanded design mapping matrix A from tree_df (columns: p leaves + one column per nonzero-weight internal node).
+#Input: tree_df, p (number of leaves/features).
+#Output: A (p*(p+g)) 0/1 matrix mapping features to groups.
+df_to_A=function (tree_df, p){
+    tree_result = gather_leaf_nodes_per_non_leaf(tree_df)$df_result
+    tree_result=tree_result[order(tree_result$depth,decreasing = T), ]
+    A = diag(p)
+    for (i in 1:nrow(tree_result)) {
+        new.col = rep(0, p)
+        if (tree_result[i, "weight"] != 0) {
+            new.col[tree_result[i, "leaves"][[1]]] = 1
+            A = cbind(A, new.col)
+        }
+    }
+    return(A)
+}
+
+#K-fold CV for RARE (logistic) over a supplied lambda grid (or one inferred from data).
+#Input: Y (n), X (n*p), tree_df, folds, seqc (optional), neg.ind, thresh, ridge.param, intercept.
+#Output: list(selected.param, beta (rarefit object), valid.error).
+cv.rare.logistic=function (Y, X, tree_df, folds = 5, seqc = NULL, neg.ind = NULL, 
+    thresh = 1e-05, ridge.param = 0, intercept = F) 
+{
+    n = length(Y)
+    p = ncol(X)
+    stopifnot(n >= 2 * folds)
+    if (is.null(neg.ind)) {
+        random_sequence <- sample(1:n)
+        index <- cut(random_sequence, breaks = folds, labels = FALSE)
+    }
+    else {
+        pos.ind.rand = sample((1:n)[-neg.ind])
+        neg.ind.rand = sample(neg.ind)
+        pos.partition = cut(pos.ind.rand, breaks = folds, labels = FALSE)
+        neg.partition = cut(neg.ind.rand, breaks = folds, labels = FALSE)
+        index = numeric(n)
+        index[-neg.ind] = pos.partition
+        index[neg.ind] = neg.partition
+    }
+    if (is.null(seqc)) {
+        seqc = rarefit.logistic(y = Y, X = X, tree_df=tree_df, intercept = F)$lambda
+    }
+    seqc = sort(seqc, decreasing = T)
+    vals.mat = matrix(0, nrow = folds, ncol = length(seqc))
+    colnames(vals.mat) = seqc
+    for (i in 1:folds) {
+        print(i)
+        X_train = X[which(index != i), ]
+        X_test = X[which(index == i), ]
+        Y_train = Y[which(index != i)]
+        Y_test = Y[which(index == i)]
+        res = rarefit.logistic(y = Y_train, X = X_train, tree_df=tree_df, 
+            intercept = F, lambda = seqc)
+        vals.mat[i, ] = negtv_lglkh(Y_test, X_test, beta = res$beta)
+    }
+    vals.vec = apply(vals.mat, 2, mean)
+    selected.param = seqc[which.min(vals.vec)]
+    beta = rarefit.logistic(Y, X, tree_df=tree_df, intercept = F, lambda = selected.param)
+    return(list(selected.param = selected.param, beta = beta, 
+        valid.error = vals.vec))
+}
+
+#Leave-one-out CV for RARE (logistic) across a lambda grid.
+#Input: Y (n), X (n*p), tree_df, seqc (optional lambda grid).
+#Output: list(cve (n*|lambda|), selected.param (length n), seqc).
+loocv.rare.logistic=function(Y,X,tree_df,seqc=NULL){
+    n=length(Y)
+    p=ncol(X)
+    A=df_to_A(tree_df,p)
+    
+    if(is.null(seqc)){
+    seqc=rarefit.logistic(y = Y,X=X,A = A,intercept = F)$lambda
+  }
+  seqc=sort(seqc,decreasing = T)
+    
+    cve=matrix(0,nrow=n,ncol=length(seqc))
+    selected.param=numeric(n)
+    for(i in 1:n){
+        res=rarefit.logistic(y=Y[-i],X=X[-i,],A = A,intercept = F,lambda = seqc)
+        loss=negtv_lglkh(Y[i],matrix(X[i,],nrow=1),res$beta)
+        #loss=(1/(1+exp(-crossprod(X[i,],res$beta)))>0.5)!=Y[i]
+        cve[i,]=loss
+        selected.param[i]=which.min(loss)
+    }
+    
+    return(list(cve=cve,selected.param=selected.param,seqc=seqc))
+}
+
+
+#One split evaluation reporting loss and AUC for LASSO, Ridge, RARE, and the tree-guided logistic model.
+#Input: y (n), X (n*p), tree_df, split.seed, nfolds, nval (test size), ridge_param, Mmratio.
+#Output: list of each method’s beta, loss, AUC, and selected tuning parameter.
+real_data_one_round_auc=function (y, X, tree_df, split.seed = 123, nfolds = 5,nval=31,ridge_param=0,Mmratio=1e+4) 
+{
+    n = nrow(X)
+    p = ncol(X)
+    set.seed(split.seed)
+    index = sample(1:nrow(X), nval)
+    X.train = X[-index, ]
+    X.test = X[index, ]
+    y.train = y[-index]
+    y.test = y[index]
+    set.seed(2 * split.seed)
+    lasso.mod = cv.glmnet(X.train, y.train, family = "binomial", 
+        alpha = 1, intercept = F, nfolds = nfolds)
+    lasso.beta = as.numeric(glmnet(X.train, y.train, family = "binomial", 
+        alpha = 1, intercept = F, lambda = lasso.mod$lambda.min)$beta)
+    lasso.loss = negtv_lglkh(y.test, X.test, lasso.beta)
+    lasso.auc = auc(roc(predictor = 1/(1 + exp(-crossprod(t(X.test), lasso.beta))),response = y.test)) 
+    lasso.param = lasso.mod$lambda.min
+    set.seed(2 * split.seed)
+    ridge.mod = cv.glmnet(X.train, y.train, family = "binomial", 
+        alpha = 0, intercept = F, nfolds = nfolds)
+    ridge.beta = as.numeric(glmnet(X.train, y.train, family = "binomial", 
+        alpha = 0, intercept = F, lambda = ridge.mod$lambda.min)$beta)
+    ridge.loss = negtv_lglkh(y.test, X.test, ridge.beta)
+    ridge.auc = auc(roc(predictor = 1/(1 + exp(-crossprod(t(X.test), ridge.beta))),response = y.test)) 
+    ridge.param = ridge.mod$lambda.min
+    set.seed(2 * split.seed)
+    rare.mod = cv.rare.logistic(y.train, X.train, tree_df, folds = nfolds)
+    rare.beta = as.numeric(rare.mod$beta$beta)
+    rare.loss = negtv_lglkh(y.test, X.test, rare.beta)
+    rare.auc = auc(roc(predictor = 1/(1 + exp(-crossprod(t(X.test), rare.beta))),response = y.test)) 
+    rare.param = rare.mod$selected.param
+    set.seed(2 * split.seed)
+    our.mod = cv.logistic(y.train, X.train, tree_df, folds = nfolds,ridge.param=ridge_param,Mmratio=Mmratio)
+    our.beta = our.mod$beta
+    our.loss = negtv_lglkh(y.test, X.test, our.beta)
+    our.auc = auc(roc(predictor = 1/(1 + exp(-crossprod(t(X.test), our.beta))),response = y.test)) 
+    our.param = our.mod$selected.param
+    return(list(lasso.beta = lasso.beta, lasso.loss = lasso.loss, 
+        lasso.auc = lasso.auc, lasso.param = lasso.param, ridge.beta = ridge.beta, 
+        ridge.loss = ridge.loss, ridge.auc = ridge.auc, ridge.param = ridge.param, 
+        rare.beta = rare.beta, rare.loss = rare.loss, rare.auc = rare.auc, 
+        rare.param = rare.param, our.beta = our.beta, our.loss = our.loss, 
+        our.auc = our.auc, our.param = our.param))
+}
+
+
+################################################## This section simulates the data with continuous outcome ################################################################
 # Simulates a k-group structure over p leaves by drawing latent locations and building an hclust tree.
 # Input: k (number of groups), p (number of leaves), tao (sd scale for within-group latent noise).
 # Output: list(tree = hclust object, group = integer vector of group labels for each leaf).
@@ -467,6 +1042,42 @@ my_ginv <- function(X, tol = 1e-8) {
   d_inv <- 1 / d
   d_inv[!is.finite(d_inv)] <- 0
   s$v %*% diag(d_inv, length(d_inv)) %*% t(s$u)
+}
+
+
+#################################################### This section simulates binary outcome data ###################################################
+
+#Simulates grouped binary-response data under a logistic model with group-sparse coefficients.
+#Input: n (samples), group.index (length p), s (group sparsity), beta.pre (optional k-vector).
+#Output: list(X (n*p), Y (n), true.beta (p), A (p*k membership)).
+
+simulate_data_binary=function(n,group.index,s=0,beta.pre=NULL){
+  k=length(unique(group.index))
+  p=length(group.index)
+  A=matrix(0,nrow = p,k)
+  for (i in 1:k) {
+    A[,i]=(group.index==i)
+  }
+  if(is.null(beta.pre)){
+    beta0=runif(k,1.5,2.5)
+  }else{
+    beta0=beta.pre
+  }
+  nonzero.ind=sample(1:k,ceiling(k*(1-s)))
+  nonzero=rep(0,k)
+  nonzero[nonzero.ind]=rep(c(-1,1),k%/%2)[1:length(nonzero.ind)]
+  beta0=beta0*nonzero
+  beta=A%*%beta0
+  X=matrix(rpois(n*p,0.02),nrow = n,ncol = p)
+  #X=matrix(rnorm(n*p,0.2,1),nrow = n,ncol = p)
+  #X=t(apply(X, 1, function(x) x/sum(x)))
+  means=crossprod(t(X),beta)
+  ps=1/(1+exp(-means))
+  Y=rbinom(n=n,size=1,prob = ps )
+  #print(sigma)
+  #sigma=1
+  #X=X/sqrt(eigen(crossprod(X))$values[1])
+  return(list(X=X,Y=Y,true.beta=beta,A=A))
 }
 
 ############################# This section contains the simulation functions for 6.1.1 ####################################
@@ -986,3 +1597,109 @@ simulate_error_valid=function(n,n0,p,k,n1=n,s=0,reps=50,ridge.param=0,thresh=1e-
   }
   return(list(our.minloss=our.minloss,rare.minloss=rare.minloss,our.rand=our.rand,rare.rand=rare.rand,our.minloss.ideal=our.minloss.ideal,rare.minloss.ideal=rare.minloss.ideal,our.rand.ideal=our.rand.ideal,rare.rand.ideal=rare.rand.ideal,oracle.ls.loss=oracle.ls.loss,ls.loss=ls.loss,ridge.loss = ridge.loss,oracle.ridge.loss = oracle.ridge.loss))#,oracle.ridge.loss=oracle.ridge.loss))
 }      
+
+
+########################################################## This section simulates Section 6.2_3 #############################################################
+
+#Repeatedly simulates data, fits RARE and the tree-guided model (plus OLS/Ridge and oracle variants), and evaluates test losses and ARI.
+#Input: n (train), n0 (test), p, k (#groups), n1 (valid), s, reps, ridge.param, thresh, weight.order.
+#Output: list of length-reps vectors: our.minloss, rare.minloss, our.rand, rare.rand, our.minloss.ideal, rare.minloss.ideal, our.rand.ideal, rare.rand.ideal, oracle.ls.loss, ls.loss, ridge.loss, oracle.ridge.loss.
+simulate_error_valid.logistic=function(n,n0,p,k,n1=n,s=0,reps=50,ridge.param=0,thresh=1e-5,weight.order=-1){
+  n1=n
+  rare.minloss=numeric(reps)
+  our.minloss=numeric(reps)
+  rare.rand=numeric(reps)
+  our.rand=numeric(reps)
+  rare.minloss.ideal=numeric(reps)
+  our.minloss.ideal=numeric(reps)
+  rare.rand.ideal=numeric(reps)
+  our.rand.ideal=numeric(reps)
+  oracle.ls.loss=numeric(reps)
+  ls.loss=numeric(reps)
+  ridge.loss         = numeric(reps)
+  oracle.ridge.loss  = numeric(reps)
+  for (i in 1:reps) {
+    cat(i,"/",reps,'\n')
+    trees=simulate_tree(k,p)
+    tree_df=hclust_to_df(trees$tree,weight.order=weight.order)
+    data=simulate_data_binary(n = n+n0+n1,group.index = trees$group)
+    train_index=sample(1:(n+n0+n1),n)
+    valid_index=sample((1:(n+n0+n1))[- train_index],n1)
+    test_index=(1:(n+n0+n1))[- c(train_index,valid_index)]
+    
+    tree_df = hclust_to_df(trees$tree, weight.order=weight.order)
+    rare.result=rarefit.logistic(data$Y[train_index],data$X[train_index,],tree_df = tree_df,intercept = F)
+    loss1=negtv_lglkh(data$Y[valid_index],data$X[valid_index,],rare.result$beta)
+    loss3=negtv_lglkh(1/(1+exp(-crossprod(t(data$X[valid_index,]),data$true.beta))),data$X[valid_index,],rare.result$beta)
+    
+    rare.beta=rare.result$beta[,which.min(loss1)]
+    rare.beta.ideal=rare.result$beta[,which.min(loss3)]
+    rare.minloss[i]=negtv_lglkh(data$Y[test_index],data$X[test_index,],rare.beta)
+    rare.minloss.ideal[i]=negtv_lglkh(data$Y[test_index],data$X[test_index,],rare.beta.ideal)
+    
+    our.result=grid.logistic(Y = data$Y[train_index],X=data$X[train_index,],tree_df,true_beta= data$true.beta,ridge.param,thresh = thresh)
+    loss2=negtv_lglkh(data$Y[valid_index],data$X[valid_index,],our.result$beta)
+    loss4=negtv_lglkh(1/(1+exp(-crossprod(t(data$X[valid_index,]),data$true.beta))),data$X[valid_index,],our.result$beta)
+    our.beta=our.result$beta[,which.min(loss2)]
+    our.beta.ideal=our.result$beta[,which.min(loss4)]
+    our.minloss[i]=negtv_lglkh(data$Y[test_index],data$X[test_index,],our.beta)
+    our.minloss.ideal[i]=negtv_lglkh(data$Y[test_index],data$X[test_index,],our.beta.ideal)
+    
+    rare.rand[i]=adjustedRandIndex(as.numeric(as.factor(data$true.beta)),as.numeric(as.factor(rare.beta)))
+    rare.rand.ideal[i]=adjustedRandIndex(as.numeric(as.factor(data$true.beta)),as.numeric(as.factor(rare.beta.ideal)))
+    our.rand[i]=adjustedRandIndex(as.numeric(as.factor(data$true.beta)),as.numeric(as.factor(our.beta)))
+    our.rand.ideal[i]=adjustedRandIndex(as.numeric(as.factor(data$true.beta)),as.numeric(as.factor(our.beta.ideal)))
+    
+    
+    ls.X=data$X[train_index,]
+    ls.Y=data$Y[train_index]
+    ls.res=glmnet(y=ls.Y,x=ls.X,lambda = 0,intercept = FALSE,nlambda = 50)
+    ls.coef=as.numeric(ls.res$beta)
+    
+    ls.loss[i]=negtv_lglkh(data$Y[test_index],data$X[test_index,],ls.coef)
+    
+    Q=make_new_X(data$X,trees$group)
+    ols.X=Q$X1[train_index,]
+    ols.res=glmnet(y=ls.Y,x=ols.X,lambda = 0,intercept = FALSE,nlambda = 50)
+    ols.coef=as.numeric(ols.res$beta)
+    
+    oracle.ls.loss[i]=negtv_lglkh(data$Y[test_index],Q$X1[test_index,],ols.coef)
+    
+    
+    X_train = data$X[train_index,]
+    Y_train = data$Y[train_index]
+    X_valid = data$X[valid_index,]
+    Y_valid = data$Y[valid_index]
+    X_test  = data$X[test_index,]
+    Y_test  = data$Y[test_index]
+    
+    # alpha=0 => Ridge, intercept=FALSE => no intercept in the model
+    fit_ridge = glmnet(X_train, Y_train, alpha = 0, intercept = FALSE,family = "binomial",nlambda = 50)
+    
+    
+    val_mse_ridge = negtv_lglkh(Y_valid,X_valid,as.matrix(fit_ridge$beta))
+    
+    ridge.beta=fit_ridge$beta[,which.min(val_mse_ridge)]
+    
+    ridge.loss[i] = negtv_lglkh(Y_test,X_test,ridge.beta)
+    
+    ##-----------------------------------------------------------------
+    ## 6. NEW: Oracle Ridge using glmnet on grouped design Q$X1
+    ##         with no intercept
+    ##-----------------------------------------------------------------
+    or.X_train = Q$X1[train_index, ]
+    or.X_valid = Q$X1[valid_index, ]
+    or.X_test  = Q$X1[test_index, ]
+    
+    fit_oracle_ridge = glmnet(or.X_train, Y_train, alpha = 0, intercept = FALSE,family = "binomial",nlambda = 50)
+    val_mse_oracle_ridge = negtv_lglkh(Y_valid,or.X_valid,as.matrix(fit_oracle_ridge$beta))
+    or.ridge.beta=fit_oracle_ridge$beta[,which.min(val_mse_oracle_ridge)]
+    
+    oracle.ridge.loss[i] = negtv_lglkh(Y_test,or.X_test,or.ridge.beta)
+    
+  
+    #bet=Q$Q%*%(solve(t(Q$X1)%*%Q$X1+ridge.param*diag(ncol(Q$Q)))%*%t(Q$X1)%*%data$Y)
+    #oracle.ridge.loss[i]=sum((bet-data$true.beta)^2)/p
+  }
+  return(list(our.minloss=our.minloss,rare.minloss=rare.minloss,our.rand=our.rand,rare.rand=rare.rand,our.minloss.ideal=our.minloss.ideal,rare.minloss.ideal=rare.minloss.ideal,our.rand.ideal=our.rand.ideal,rare.rand.ideal=rare.rand.ideal,oracle.ls.loss=oracle.ls.loss,ls.loss=ls.loss,ridge.loss = ridge.loss,oracle.ridge.loss = oracle.ridge.loss))#,oracle.ridge.loss=oracle.ridge.loss))
+}
