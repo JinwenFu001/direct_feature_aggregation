@@ -4,3 +4,11 @@
 .RData
 .Ruserdata
 *.Rproj
+
+# Local system files, installed packages, and runtime logs
+.DS_Store
+.AppleDouble
+._*
+code/core_code/rlib/
+output/**/*.Rout
+output/**/*.out

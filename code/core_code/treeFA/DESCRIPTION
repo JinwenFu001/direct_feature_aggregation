@@ -1,0 +1,24 @@
+Package: treeFA
+Type: Package
+Title: Tree-Guided Feature Aggregation
+Version: 0.0.2
+Author: Jinwen Fu [aut, cre]
+Maintainer: Jinwen Fu <jinwen@example.com>
+Authors@R: c(
+    person("Jinwen", "Fu", role = c("aut", "cre"), email = "jinwen@example.com")
+  )
+Description: Fits tree-guided feature aggregation models for linear and binary
+    outcomes using a direct tree penalty. The main linear proximal-gradient
+    solver is implemented in C++. Separate Davis-Yin splitting interfaces
+    jointly aggregate and select features with an additional L1 penalty,
+    including two-parameter paths and cross-validation.
+License: GPL-3
+Encoding: UTF-8
+Roxygen: list(markdown = TRUE)
+RoxygenNote: 7.3.2
+Imports: MASS, Rcpp
+Suggests: glmnet, testthat (>= 3.0.0)
+LinkingTo: Rcpp, RcppEigen
+Config/testthat/edition: 3
+NeedsCompilation: yes
+Packaged: 2026-10-02 00:50:29 UTC; jinwen

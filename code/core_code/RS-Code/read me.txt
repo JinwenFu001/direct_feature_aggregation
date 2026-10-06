@@ -1,0 +1,12 @@
+It’s All Relative: New Regression Paradigm for Microbiome Compositional Data
+
+
+To run the proposed methods, please first compile the SPG code. Specifically, go to the SPG folder and run install_mex.m to mex .c files (I have mexed the .c files under windows for both 32 and 64 bit machines)
+
+Then run Simulation.m file to get simulation results of the proposed methods in the paper. 
+
+If there is any comment or question, please contact: ligen@umich.edu
+
+
+
+
